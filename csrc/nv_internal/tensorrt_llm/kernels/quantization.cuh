@@ -878,8 +878,8 @@ quantize_with_block_size_tiled(
   int const global_row_idx = blockIdx.x / num_col_blocks;
   int const col_block_idx = blockIdx.x % num_col_blocks;
 
-  int const batchIdx = global_row_idx / numRows;
-  int const rowIdx = global_row_idx % numRows;
+  int const batchIdx = global_row_idx / numPaddedRowsForSf;
+  int const rowIdx = global_row_idx % numPaddedRowsForSf;
 
   if (global_row_idx >= numPaddedRowsForSf * numbatches) {
     return;
