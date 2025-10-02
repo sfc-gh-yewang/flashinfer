@@ -956,7 +956,7 @@ quantize_with_block_size_tiled(
       int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * num_col_threads + colIdx;
       int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * num_padded_col_threads + colIdx;
       
-      PackedVec const in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+      PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
 
       if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
         reinterpret_cast<uint32_t*>(out)[outOffset] =

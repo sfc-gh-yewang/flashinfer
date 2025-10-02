@@ -69,10 +69,10 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
                               : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                               \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
+  tensorrt_llm::kernels::invokeFP4QuantizationTiled<T, SF_VEC_SIZE>(                             \
       1, m, k, reinterpret_cast<T*>(self->data), globalScalePtr,                                 \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, /*mask=*/nullptr, enable_pdl,                    \
+      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl,                    \
       get_stream(self->device));
 
   if (sfUseUE8M0) {
