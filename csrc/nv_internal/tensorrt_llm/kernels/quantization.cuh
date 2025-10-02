@@ -837,6 +837,104 @@ quantize_with_block_size(
 #endif
 }
 
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+// A block size of 256 is a good general-purpose choice for this workload.
+__launch_bounds__(256)
+#endif
+quantize_with_block_size_tiled(
+    int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile("griddepcontrol.wait;");
+
+  static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
+                                             ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
+                                             : CVT_ELTS_PER_THREAD;
+
+  constexpr int COLS_PER_BLOCK = 1024;
+  static_assert(COLS_PER_BLOCK % SF_VEC_SIZE == 0, "COLS_PER_BLOCK must be a multiple of SF_VEC_SIZE");
+
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+  static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+  bool const isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                                  layout == QuantizationSFLayout::SWIZZLED_8x4;
+  int const rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+  int const numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
+  int const numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+  int const num_col_threads = numCols / ELTS_PER_THREAD;
+  int const num_padded_col_threads = numPaddedCols / ELTS_PER_THREAD;
+  int const num_col_threads_for_sf = numColsForSf / ELTS_PER_THREAD;
+  int const col_items_per_block = COLS_PER_BLOCK / ELTS_PER_THREAD;
+
+  int const num_col_blocks = (num_col_threads_for_sf + col_items_per_block - 1) / col_items_per_block;
+
+  int const global_row_idx = blockIdx.x / num_col_blocks;
+  int const col_block_idx = blockIdx.x % num_col_blocks;
+
+  int const batchIdx = global_row_idx / numRows;
+  int const rowIdx = global_row_idx % numRows;
+
+  if (global_row_idx >= numPaddedRowsForSf * numbatches) {
+    return;
+  }
+
+  int const start_col_thread_idx = col_block_idx * col_items_per_block;
+
+  for (int colIdx = start_col_thread_idx + threadIdx.x;
+       colIdx < start_col_thread_idx + col_items_per_block && colIdx < num_col_threads_for_sf;
+       colIdx += blockDim.x) {
+
+    bool const is_padding_element = (rowIdx >= numRows) || (colIdx >= num_col_threads);
+
+    std::optional<int> optionalBatchIdx = numbatches > 1 ? std::optional<int>(batchIdx) : std::nullopt;
+    std::optional<int> optionalNumRows = numRows;
+
+    uint8_t* sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, num_padded_col_threads / CVT_NUM_THREADS_PER_SF,
+        SFout, layout);
+
+    // If this is a padding element, write zeros and continue.
+    if (is_padding_element) {
+      if (rowIdx < numRows && colIdx < num_padded_col_threads) {
+        int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * num_padded_col_threads + colIdx;
+        if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+          reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+        } else {
+          reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+        }
+      }
+      if (sf_out != nullptr) {
+        *sf_out = 0x00;
+      }
+    } else { 
+      int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * num_col_threads + colIdx;
+      int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * num_padded_col_threads + colIdx;
+
+      PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+
+      if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+        reinterpret_cast<uint32_t*>(out)[outOffset] =
+            cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+      } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+        reinterpret_cast<uint64_t*>(out)[outOffset] =
+            cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+      } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+        reinterpret_cast<uint64_t*>(out)[outOffset] =
+            cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 }  // namespace kernels

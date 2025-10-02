@@ -90,7 +90,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                               : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+  tensorrt_llm::kernels::invokeFP4QuantizationTiled<T, SF_VEC_SIZE>(                               \
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
