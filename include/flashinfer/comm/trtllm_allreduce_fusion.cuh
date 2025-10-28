@@ -767,7 +767,7 @@ struct AllReduceFusionParams {
   QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
-  bool trigger_completion_at_end = true;
+  bool trigger_completion_at_end = false;
 };
 
 template <int NRanks>
@@ -1446,6 +1446,8 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
 template <typename T>
 cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool launch_with_pdl,
                                 bool fp32_acc) {
+  // bugbug: force disable fp32 accumulation for now  
+  fp32_acc = false;
 #define DISPATCH_ACC_TYPE(T, Pattern, NRanks)                                                      \
   if constexpr (std::is_same_v<T, float>) {                                                        \
     return allreduce_fusion_kernel_launcher<Pattern, T, NRanks, false>(params, launch_with_pdl);   \
