@@ -1230,7 +1230,8 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   cfg.numAttrs = SM >= 90 ? 2 : 0;
 
   if (oneshot) {
-    bool trigger_completion_at_end = params.trigger_completion_at_end;
+    // bool trigger_completion_at_end = params.trigger_completion_at_end;
+    bool trigger_completion_at_end = false; // for better PDL overlap
     if (trigger_completion_at_end) {
       FLASHINFER_CUDA_CALL((launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, true>(params, cfg)));
     } else {
