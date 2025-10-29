@@ -1,9 +1,11 @@
-// vLLM AllReduce Fusion (optimized one-shot path with float4 mailbox)
-// - One-shot Lamport path: 128-bit vectorized ops (float4), volatile polling, 32b -0 sentinel.
-// - Two-shot path: keeps generic vec_t-based implementation.
-// - Launcher uses TRT-like occupancy heuristic; barrier table size increased.
+// vLLM AllReduce Fusion (optimized one-shot & two-shot with float4 mailbox)
+// - One-shot Lamport: 128-bit vectorized ops (float4), volatile polling, 32b -0 sentinel, PTX-forced LD/ST
+// - Two-shot: vectorized with float4 PTX LD/ST, same FusedOp128 as one-shot
+// - Launcher uses TRT-like occupancy heuristic; barrier table size increased
 //
 // File: include/flashinfer/comm/trtllm_allreduce_fusion.cuh
+
+#pragma once
 
 #include <cooperative_groups.h>
 #include <cuda.h>
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <tuple>
 #include <type_traits>
+#include <cstdint>
 
 #include "../exception.h"
 #include "../fp4_layout.cuh"
@@ -26,8 +29,14 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 
-namespace flashinfer {
+#ifndef NDEBUG
+#define ASSERT_ALIGN_16(ptr) \
+  FLASHINFER_CHECK(((reinterpret_cast<uintptr_t>(ptr)) & 0xF) == 0, "Pointer must be 16B aligned")
+#else
+#define ASSERT_ALIGN_16(ptr) do {} while(0)
+#endif
 
+namespace flashinfer {
 namespace trtllm_allreduce_fusion {
 
 using flashinfer::QuantizationSFLayout;
@@ -452,7 +461,7 @@ template <AllReduceFusionPattern Pattern>
 struct FusionPatternTraits;
 
 #define DEFINE_FUSION_PATTERN_TRAITS(pattern, hasAllReduceOut, hasResidual, hasResidualOut, hasRMSNorm, hasNormOut, quantType) \
-  template <> struct FusionPatternTraits<pattern> { \
+  template <> struct FusionPatternTraits[pattern] { \
     static constexpr bool kHasAllReduceOut = hasAllReduceOut; \
     static constexpr bool kHasResidual     = hasResidual; \
     static constexpr bool kHasResidualOut  = hasResidualOut; \
@@ -461,13 +470,12 @@ struct FusionPatternTraits;
     static constexpr QuantType kQuantType  = quantType; \
   };
 
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduce, true,  false, false, false, false, QuantType::kNone)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNorm, false, true,  true,  true,  true,  QuantType::kNone)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP8Quant, false, true, true,  true,  false, QuantType::kFP8)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP4Quant, false, true, true,  true,  false, QuantType::kFP4)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, true, true, true, true, QuantType::kFP8)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true, true, true, true, QuantType::kFP4)
-#undef DEFINE_FUSION_PATTERN_TRAITS
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kAllReduce>                    { static constexpr bool kHasAllReduceOut=true,  kHasResidual=false, kHasResidualOut=false, kHasRMSNorm=false, kHasNormOut=false; static constexpr QuantType kQuantType=QuantType::kNone; };
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kARResidualRMSNorm>            { static constexpr bool kHasAllReduceOut=false, kHasResidual=true,  kHasResidualOut=true,  kHasRMSNorm=true,  kHasNormOut=true;  static constexpr QuantType kQuantType=QuantType::kNone; };
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kARResidualRMSNormFP8Quant>    { static constexpr bool kHasAllReduceOut=false, kHasResidual=true,  kHasResidualOut=true,  kHasRMSNorm=true,  kHasNormOut=false; static constexpr QuantType kQuantType=QuantType::kFP8;  };
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kARResidualRMSNormFP4Quant>    { static constexpr bool kHasAllReduceOut=false, kHasResidual=true,  kHasResidualOut=true,  kHasRMSNorm=true,  kHasNormOut=false; static constexpr QuantType kQuantType=QuantType::kFP4;  };
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant> { static constexpr bool kHasAllReduceOut=false, kHasResidual=true,  kHasResidualOut=true,  kHasRMSNorm=true,  kHasNormOut=true;  static constexpr QuantType kQuantType=QuantType::kFP8;  };
+template <> struct FusionPatternTraits<AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant> { static constexpr bool kHasAllReduceOut=false, kHasResidual=true,  kHasResidualOut=true,  kHasRMSNorm=true,  kHasNormOut=true;  static constexpr QuantType kQuantType=QuantType::kFP4;  };
 
 template <AllReduceFusionPattern Pattern> constexpr bool HasResidual   = FusionPatternTraits<Pattern>::kHasResidual;
 template <AllReduceFusionPattern Pattern> constexpr bool HasRMSNorm    = FusionPatternTraits<Pattern>::kHasRMSNorm;
@@ -501,7 +509,7 @@ struct AllReduceFusionParams {
 };
 
 // ============================================================================
-// Comm structs + Barrier (unchanged)
+// Comm structs + Barrier
 // ============================================================================
 template <int NRanks>
 struct SyncComm {
@@ -615,7 +623,7 @@ class Barrier {
 };
 
 // ============================================================================
-// ONE-SHOT float4 helpers + FusedOp128 (fast path)
+// Float4 (128-bit) helpers, including PTX LD/ST, and FusedOp128
 // ============================================================================
 namespace ar128 {
 __device__ __forceinline__ bool is_neg_zero32(float v) { return __float_as_uint(v) == 0x80000000u; }
@@ -628,12 +636,25 @@ __device__ __forceinline__ float4 get_neg_zero128() {
   for (int i = 0; i < 4; ++i) reinterpret_cast<uint32_t*>(&vec)[i] = 0x80000000u;
   return vec;
 }
+
+// Non-volatile and volatile 128-bit loads; and 128-bit stores (forced via PTX)
+__device__ __forceinline__ float4 ld_global_f4(const float4* p) {
+  float4 out;
+  asm volatile("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+               : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w) : "l"(p));
+  return out;
+}
 __device__ __forceinline__ float4 ld_global_volatile_f4(const float4* p) {
   float4 out;
   asm volatile("ld.volatile.global.v4.f32 {%0,%1,%2,%3}, [%4];"
                : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w) : "l"(p));
   return out;
 }
+__device__ __forceinline__ void st_global_f4(float4* p, const float4& v) {
+  asm volatile("st.global.v4.f32 [%0], {%1,%2,%3,%4};"
+               :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+}
+
 template <typename DType>
 __device__ __forceinline__ float4 add128(float4 const& a, float4 const& b) {
   float4 c;
@@ -773,7 +794,7 @@ class FusedOp128 {
 };
 
 // ============================================================================
-// Generic FusedOp (vec_t path) for TWO-SHOT and any generic uses
+// Generic FusedOp (vec_t path) retained only for completeness (unused now)
 // ============================================================================
 template <AllReduceFusionPattern Pattern, typename T>
 class FusedOp {
@@ -786,7 +807,6 @@ class FusedOp {
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8)      m_scale_factor = 1.f / *params.scale_factor;
     else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) m_scale_factor = *params.scale_factor;
   }
-
   __device__ __forceinline__ void update(int access_id) {
     if (m_access_id != access_id) {
       m_access_id = access_id;
@@ -795,7 +815,6 @@ class FusedOp {
       }
     }
   }
-
   __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
       val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
@@ -812,7 +831,6 @@ class FusedOp {
         val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
-
 #if CUDA_VERSION >= 12080
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
@@ -881,77 +899,6 @@ class FusedOp {
 };
 
 // ============================================================================
-// Original generic negative-zero helpers (kept for two-shot path)
-// ============================================================================
-template <typename T> struct neg_zero { static constexpr T value = -T(0); };
-template <> struct neg_zero<half> {
-  static constexpr unsigned short neg_zero_bits = 0x8000U;
-  static constexpr __half value = __half_raw{neg_zero_bits};
-};
-template <> struct neg_zero<__nv_bfloat16> {
-  static constexpr unsigned short neg_zero_bits = 0x8000U;
-  static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
-};
-template <> struct neg_zero<float> {
-  static constexpr unsigned int neg_zero_bits = 0x80000000U;
-  static constexpr float value = -0.0f;
-};
-template <typename T> __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T> __device__ bool is_negative_zero(T) { return false; }
-template <> __device__ bool is_negative_zero<float>(float x) { return (__float_as_int(x) == 0x80000000); }
-template <> __device__ bool is_negative_zero<double>(double x) {
-  return (__double_as_longlong(x) == 0x8000000000000000ULL);
-}
-template <> __device__ bool is_negative_zero<__half>(__half x) { return (__half_as_ushort(x) == 0x8000); }
-template <> __device__ bool is_negative_zero<__nv_bfloat16>(__nv_bfloat16 x) { return (__bfloat16_as_ushort(x) == 0x8000); }
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) if (is_negative_zero(vec[i])) return true;
-  return false;
-}
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) vec[i] = (is_negative_zero(vec[i])) ? static_cast<T>(0.f) : vec[i];
-}
-template <typename T>
-__device__ __forceinline__ void set_neg_zero(T* addr) {
-  vec_t<T, details::kBytesPerAccess / sizeof(T)> val;
-  val.fill(neg_zero_v<T>);
-  val.store_global_volatile(addr);
-}
-
-// ============================================================================
-// vec_t based sum (used by two-shot path)
-// ============================================================================
-template <typename T, uint32_t VEC_SIZE, int NRanks, bool Fp32Acc>
-__device__ __forceinline__ vec_t<T, VEC_SIZE> allreduce_sum(vec_t<T, VEC_SIZE>* vals) {
-  if constexpr (Fp32Acc) {
-    static_assert(!std::is_same_v<T, float>);
-    float acc_f32[VEC_SIZE];
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) acc_f32[i] = static_cast<float>(reinterpret_cast<T*>(&vals[0])[i]);
-#pragma unroll
-    for (int r = 1; r < NRanks; ++r) {
-#pragma unroll
-      for (int i = 0; i < VEC_SIZE; ++i) acc_f32[i] += static_cast<float>(reinterpret_cast<T*>(&vals[r])[i]);
-    }
-    vec_t<T, VEC_SIZE> acc;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) acc[i] = static_cast<T>(acc_f32[i]);
-    return acc;
-  } else {
-    vec_t<T, VEC_SIZE> acc = vals[0];
-#pragma unroll
-    for (int r = 1; r < NRanks; ++r) acc = vec_add<T, VEC_SIZE>(acc, vals[r]);
-    return acc;
-  }
-}
-
-// ============================================================================
 // Index helper
 // ============================================================================
 template <typename T>
@@ -985,7 +932,7 @@ class IndexHelper {
 };
 
 // ============================================================================
-// ONE-SHOT Lamport kernel (float4 mailbox)
+// ONE-SHOT Lamport kernel (float4 mailbox with forced PTX)
 // ============================================================================
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
           bool TriggerCompletionAtEnd = true>
@@ -1010,26 +957,43 @@ allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
 #endif
 
   LamportComm<NRanks> comm(params.workspace, params.rank);
+
+  // Debug-mode alignment checks
+  ASSERT_ALIGN_16(params.allreduce_in);
+  ASSERT_ALIGN_16(comm.clear_buf);
+#pragma unroll
+  for (int rr = 0; rr < NRanks; ++rr) ASSERT_ALIGN_16(comm.data_bufs[rr]);
+
   int clear_access = comm.clear_size / VEC_SIZE;
 
-  // Producer: push 16B lanes to all ranks, scrub -0 sentinel per 32b word
+  // Producer: push 16B lanes to all ranks, scrub 32b -0 sentinel per lane
+  const float4* __restrict__ in_f4 = reinterpret_cast<const float4*>(params.allreduce_in);
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
-    float4 v = reinterpret_cast<float4 const*>(params.allreduce_in)[idx];
+    // Force a 128-bit load from input.
+    float4 v = ar128::ld_global_f4(&in_f4[idx]);
+
+    // Scrub 32b -0.0f sentinel per lane.
     if (ar128::is_neg_zero128(v)) {
-      alignas(16) float tmp[4]; *reinterpret_cast<float4*>(tmp) = v;
+      alignas(16) float tmp[4];
+      *reinterpret_cast<float4*>(tmp) = v;
 #pragma unroll
       for (int i = 0; i < 4; ++i) if (ar128::is_neg_zero32(tmp[i])) tmp[i] = 0.f;
       v = *reinterpret_cast<float4*>(tmp);
     }
+
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx] = v;
+      float4* __restrict__ out_f4_r =
+          reinterpret_cast<float4*>(comm.data_bufs[r]) + (params.rank * tot_access + idx);
+      // Force a 128-bit store to mailbox.
+      ar128::st_global_f4(out_f4_r, v);
     }
   }
 
-  // Clear previous comm buffer region with -0 sentinel (128-bit store)
+  // Clear previous comm buffer window with -0 sentinel (128-bit store)
+  float4* __restrict__ clr = reinterpret_cast<float4*>(comm.clear_buf);
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    ar128::st_global_f4(&clr[idx], clear_vec);
   }
 
   // Consumer: volatile 128-bit polling
@@ -1058,7 +1022,7 @@ allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
 }
 
 // ============================================================================
-// TWO-SHOT Sync kernel (generic path; vec_t + FusedOp)
+// TWO-SHOT Sync kernel (vectorized with float4 PTX + FusedOp128)
 // ============================================================================
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 __global__ void __launch_bounds__(1024)
@@ -1074,45 +1038,52 @@ allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> params,
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
 
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+  FusedOp128<Pattern, T> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
   SyncComm<NRanks> comm(params.workspace);
+
+  // Stage 1: push local slices to comm buffer (forced 128-bit LD/ST)
+  const float4* __restrict__ in4  = reinterpret_cast<const float4*>(params.allreduce_in);
+  float4* __restrict__ out_rank   = reinterpret_cast<float4*>(comm.comm_bufs[params.rank]);
+
 #pragma unroll
   for (int r = 0; r < NRanks; ++r) {
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
     int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.allreduce_in)[idx];
+      ar128::st_global_f4(&out_rank[idx], ar128::ld_global_f4(&in4[idx]));
     }
   }
 
   Barrier<NRanks> barrier(params.rank, comm);
   barrier.sync();
 
+  // Stage 2: local rank does reduction for its chunk; write sum to all ranks' "second half"
   int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / VEC_SIZE;
   int comm_tot_access =
       (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / VEC_SIZE;
-
   for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-    vec_t<T, VEC_SIZE> vals[NRanks];
+    float4 vals[NRanks];
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      vals[r].load(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
+      float4* __restrict__ buf_r = reinterpret_cast<float4*>(comm.comm_bufs[r]);
+      vals[r] = ar128::ld_global_f4(&buf_r[idx]);
     }
-    vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
+    float4 sum_val = ar128::allreduce_sum128<T, NRanks, Fp32Acc>(vals);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      sum_val.store(reinterpret_cast<T*>(comm.comm_bufs[r]) + (tot_access + idx) * VEC_SIZE);
+      float4* __restrict__ buf_r = reinterpret_cast<float4*>(comm.comm_bufs[r]);
+      ar128::st_global_f4(&buf_r[tot_access + idx], sum_val);
     }
   }
 
   barrier.sync();
 
+  // Stage 3: consume reduced data for all ranks; fuse
 #pragma unroll
   for (int r = 0; r < NRanks; ++r) {
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
@@ -1121,10 +1092,9 @@ allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> params,
     for (int idx = comm_access_id, tidx = comm_token_id; idx < comm_tot_access;
          idx += access_stride, tidx += token_stride) {
       fused_op.update(idx);
-      vec_t<T, VEC_SIZE> sum_val;
-      sum_val.load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
-                   (tot_access + idx) * VEC_SIZE);
-      fused_op(sum_val, tidx);
+      float4* __restrict__ my_buf = reinterpret_cast<float4*>(comm.comm_bufs[params.rank]);
+      float4 sum_val4 = ar128::ld_global_f4(&my_buf[tot_access + idx]);
+      fused_op(sum_val4, tidx);
     }
   }
 
@@ -1166,7 +1136,7 @@ cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaun
   return cudaSuccess;
 }
 
-bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
+inline bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
 
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& params,
@@ -1230,8 +1200,7 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   cfg.numAttrs = SM >= 90 ? 2 : 0;
 
   if (oneshot) {
-    // bool trigger_completion_at_end = params.trigger_completion_at_end;
-    bool trigger_completion_at_end = false; // for better PDL overlap
+    bool trigger_completion_at_end = params.trigger_completion_at_end;
     if (trigger_completion_at_end) {
       FLASHINFER_CUDA_CALL((launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, true>(params, cfg)));
     } else {
@@ -1245,12 +1214,12 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
 }
 
 // ============================================================================
-// Public entry (pattern/rank dispatch). We keep fp32_acc forced off for parity.
+// Public entry (pattern/rank dispatch). Keep fp32_acc forced off for parity.
 // ============================================================================
 template <typename T>
 cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool launch_with_pdl,
                                 bool fp32_acc) {
-  // keep parity with original: force disable fp32 accumulation for now
+  // Force disable fp32 accumulation for now (parity with original)
   fp32_acc = false;
 #define DISPATCH_ACC_TYPE(T_, Pattern, NRanks)                                                     \
   if constexpr (std::is_same_v<T_, float>) {                                                       \
@@ -1308,5 +1277,4 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
 }
 
 }  // namespace trtllm_allreduce_fusion
-
 }  // namespace flashinfer
