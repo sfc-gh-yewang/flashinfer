@@ -1147,7 +1147,8 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   static int SM = utils::getSMVersion();
 
   int token_num = params.size / params.hidden_dim;
-  bool oneshot = params.use_oneshot;
+  // bool oneshot = params.use_oneshot;
+  bool oneshot = false;
 
   int cluster_num = token_num;
   std::array<int, NRanks> begin_tokens{}, token_num_per_ranks{};
